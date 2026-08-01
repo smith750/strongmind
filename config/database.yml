@@ -1,0 +1,40 @@
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  host: <%= ENV.fetch("DATABASE_HOST", "localhost") %>
+  port: <%= ENV.fetch("DATABASE_PORT", 5432) %>
+  username: <%= ENV.fetch("DATABASE_USERNAME", "postgres") %>
+  password: <%= ENV.fetch("DATABASE_PASSWORD", "postgres") %>
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+
+development:
+  <<: *default
+  database: strongmind_development
+
+# Warning: The database defined as "test" will be erased and
+# re-generated from your development database when you run "rake".
+# Do not set this db to the same as development or production.
+test:
+  <<: *default
+  database: strongmind_test
+
+# Store production database name, username, and password in the
+# STRONGMIND_DATABASE_PASSWORD environment variable, injected via Kamal secrets.
+production:
+  primary: &primary_production
+    <<: *default
+    database: strongmind_production
+    username: strongmind
+    password: <%= ENV["STRONGMIND_DATABASE_PASSWORD"] %>
+  cache:
+    <<: *primary_production
+    database: strongmind_production_cache
+    migrations_paths: db/cache_migrate
+  queue:
+    <<: *primary_production
+    database: strongmind_production_queue
+    migrations_paths: db/queue_migrate
+  cable:
+    <<: *primary_production
+    database: strongmind_production_cable
+    migrations_paths: db/cable_migrate
