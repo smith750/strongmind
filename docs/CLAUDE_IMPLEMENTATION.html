@@ -201,7 +201,32 @@
 <h3>Testing</h3>
 <p><code>test/services/github/enrich_user_test.rb</code> covers: creating a new <code>User</code> and linking it on a fresh 200, sending no <code>If-None-Match</code> when nothing is known yet, sending it (and linking without creating a duplicate) when a <code>User</code> is already known and GitHub returns 304, updating an existing <code>User</code>'s fields in place when a 200 comes back with changed data, two push events by the same author converging on one <code>User</code> row, marking <code>user_unenrichable</code> (with the <code>Request</code> still persisted) on a 4xx, ERROR logging with no <code>Request</code> row and no state change on a network failure, the blank-<code>github_actor_id</code> guard (WARN, zero HTTP calls), and the two already-enriched/already-<code>unenrichable</code> no-op guards. 11 tests, 42 assertions, all green - 45 tests/124 assertions across the whole suite. <code>bin/rubocop</code> and <code>bin/brakeman</code> both clean.</p>
 
-<h2>Phase 4 — Pull repositories <span class="status pending">pending</span></h2>
+<h2>Phase 4 — Pull repositories <span class="status done">done</span></h2>
+
+<p>Built <code>Github::EnrichRepository</code> (<code>app/services/github/enrich_repository.rb</code>) - the repository half of "Fan Out", and structurally a direct mirror of Phase 3's <code>Github::EnrichUser</code>: given a single <code>PushEvent</code> that still needs its repository resolved, it looks up any existing <code>Repository</code> by <code>github_repository_id</code>, makes one conditional GET against GitHub's "get a repository by id" endpoint via the shared <code>Github::ApiRequest</code>, and either links the (created or refreshed) <code>Repository</code> or, on a 4xx, marks the push event <code>repo_unenrichable</code> so it permanently drops out of the Phase 5 backlog query. No new shared code was needed - <code>Github::ApiRequest</code> already covered the request/response mechanics.</p>
+
+<h3>Design decisions</h3>
+<table>
+<tr><th>Area</th><th>Decision</th><th>Why</th></tr>
+<tr>
+  <td>Endpoint</td>
+  <td><code>GET https://api.github.com/repositories/{github_repository_id}</code> (the numeric-id form), not <code>/repos/{owner}/{repo}</code>.</td>
+  <td>Mirrors the reasoning for users in Phase 3: the design stores only <code>github_repository_id</code> on <code>PushEvent</code>, and GitHub's REST API has a dedicated "get a repository using its ID" endpoint for exactly that, so no owner/name lookup is needed.</td>
+</tr>
+<tr>
+  <td>Everything else</td>
+  <td>Same shape as <code>Github::EnrichUser</code>: always one request (fresh or conditional depending on whether a local <code>Repository</code> already exists), dedup by <code>github_repository_id</code> with in-place updates rather than new rows, 4xx → permanent <code>repo_unenrichable</code> with the <code>Request</code> still persisted, 5xx/network failure → ERROR logged, no <code>Request</code> row, push event left retryable, blank <code>github_repository_id</code> → immediate <code>repo_unenrichable</code> with no HTTP call, guarded no-op if already enriched/unenrichable.</td>
+  <td>The design's Fan Out and Rate-limit sections describe contributors and repositories with parallel language throughout ("for each contributor <em>and repository</em>..."), so there was no reason for the two enrichment paths to diverge in behavior - only in which model and endpoint they touch.</td>
+</tr>
+</table>
+
+<h3>Testing</h3>
+<p><code>test/services/github/enrich_repository_test.rb</code> mirrors <code>enrich_user_test.rb</code>'s eleven cases one-for-one against <code>Repository</code>/<code>repo_unenrichable</code>/<code>repository_id</code> instead of <code>User</code>/<code>user_unenrichable</code>/<code>author_id</code>. 11 tests, 42 assertions, all green.</p>
+
+<div class="note">
+<strong>Environment fix: disabled test parallelization.</strong> Adding this phase's 11 tests pushed the suite from 45 to 56 tests, crossing Rails' default parallel-test threshold (50) for the first time. That activated <code>parallelize(workers: :number_of_processors)</code> in <code>test_helper.rb</code> - 12 workers on this machine, each needing its own cloned test database - and that cloning step hung indefinitely in this environment (confirmed by forcing <code>PARALLEL_WORKERS=1</code>, which ran all 56 tests in 0.17s). Since this suite runs in well under a second single-process and Phase 8's Docker Compose <code>test</code> service will invoke <code>bin/rails test</code> the same way, leaving parallelization on would hand the reviewer the identical hang the moment the suite crossed 50 tests - which it now permanently has. Changed <code>test_helper.rb</code> to <code>parallelize(workers: 1)</code> rather than rely on an env var override reviewers wouldn't know to set.
+</div>
+
 <h2>Phase 5 — <code>Github::IngestCycle</code> budget/backlog logic <span class="status pending">pending</span></h2>
 <h2>Phase 6 — Rake task ("repeatable") <span class="status pending">pending</span></h2>
 <h2>Phase 7 — Solid Queue job ("continuous") <span class="status pending">pending</span></h2>
