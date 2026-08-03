@@ -425,5 +425,103 @@ Fixed by adding a <code>queue</code> role to <code>database.yml</code> for both 
 </ul>
 <p>No unsafe operations were flagged - expected, since none of the four existing migrations do anything the gem checks for (they're all <code>create_table</code>, which <code>strong_migrations</code> doesn't flag) and they predate <code>start_after</code> regardless.</p>
 
+<h3>Converted the test suite from Minitest to RSpec</h3>
+
+<p>Added <a href="https://github.com/rspec/rspec-rails"><code>rspec-rails</code></a> and converted every test in <code>test/</code> to an equivalent spec in <code>spec/</code> using <code>expect(...).to</code>/<code>.not_to</code> syntax, then removed <code>test/</code> entirely - one framework, not two running in parallel.</p>
+
+<h4>What was done</h4>
+<ul>
+  <li>Added <code>gem "rspec-rails"</code> to the existing <code>group :development, :test</code> block in the <code>Gemfile</code> (needs to be in <code>:development</code> too, same as Rails' own generator support, so <code>rails generate rspec:install</code> and future spec generators work).</li>
+  <li>Ran <code>bin/rails generate rspec:install</code> (<code>.rspec</code>, <code>spec/spec_helper.rb</code>, <code>spec/rails_helper.rb</code>), then generated a <code>bin/rspec</code> binstub via <code>bundle binstubs rspec-core</code> for parity with the rest of <code>bin/</code>.</li>
+  <li>In <code>spec/rails_helper.rb</code>: added <code>require "webmock/rspec"</code> and <code>WebMock.disable_net_connect!</code> (the RSpec equivalent of what <code>test/test_helper.rb</code> did with <code>webmock/minitest</code>), and enabled <code>config.infer_spec_type_from_file_location!</code> so <code>spec/jobs/*_spec.rb</code> gets <code>type: :job</code> inferred automatically - that's what pulls in <code>ActiveJob::TestHelper</code> (needed for <code>have_enqueued_job</code> in <code>github_ingest_job_spec.rb</code>) without an explicit include. Removed the generator's default <code>config.fixture_paths</code> line - this app has never had any ActiveRecord fixture files (<code>test/fixtures/*.yml</code> never existed, every test builds its own records), so there was nothing to point it at.</li>
+  <li>Converted all eleven test files one-for-one into <code>spec/</code>, mirroring the original directory layout (<code>spec/models</code>, <code>spec/services/github</code>, <code>spec/jobs</code>, <code>spec/tasks</code>, <code>spec/config</code>). Deleted <code>test/</code> (including <code>test_helper.rb</code> and the empty generator-scaffolded directories like <code>test/mailers</code>) once every spec passed - no parallel Minitest suite left behind.</li>
+  <li>Updated the two places that still invoked the Minitest runner by name: the <code>test</code> Docker Compose service (Phase 8) now runs <code>bin/rspec</code> instead of <code>bin/rails test</code>, and <code>config/ci.rb</code>'s <code>bin/ci</code> step ("Tests: Rails") does the same - both would otherwise have silently kept passing on an empty/nonexistent Minitest suite instead of actually running anything.</li>
+</ul>
+
+<h4>Minitest &rarr; RSpec mapping used</h4>
+<table>
+<tr><th>Minitest</th><th>RSpec</th></tr>
+<tr><td><code>assert x.valid?</code></td><td><code>expect(x).to be_valid</code></td></tr>
+<tr><td><code>assert_not x.valid?</code></td><td><code>expect(x).not_to be_valid</code></td></tr>
+<tr><td><code>assert_equal a, b</code></td><td><code>expect(b).to eq(a)</code></td></tr>
+<tr><td><code>assert_nil x</code></td><td><code>expect(x).to be_nil</code></td></tr>
+<tr><td><code>assert_includes collection, x</code></td><td><code>expect(collection).to include(x)</code></td></tr>
+<tr><td><code>assert_raises(Error) { ... }</code></td><td><code>expect { ... }.to raise_error(Error)</code></td></tr>
+<tr><td><code>assert_difference "Model.count", 1 do ... end</code></td><td><code>expect { ... }.to change(Model, :count).by(1)</code></td></tr>
+<tr><td><code>assert_no_difference "Model.count" do ... end</code></td><td><code>expect { ... }.not_to change(Model, :count)</code></td></tr>
+<tr><td><code>assert_match(/re/, str)</code></td><td><code>expect(str).to match(/re/)</code></td></tr>
+<tr><td><code>assert_requested :get, url</code> (webmock)</td><td><code>expect(a_request(:get, url)).to have_been_made</code></td></tr>
+<tr><td><code>assert_not_requested :get, url</code> (webmock)</td><td><code>expect(a_request(:get, url)).not_to have_been_made</code></td></tr>
+<tr><td><code>assert_enqueued_with(job: X) { ... }</code></td><td><code>expect { ... }.to have_enqueued_job(X)</code></td></tr>
+<tr><td><code>assert_no_enqueued_jobs { ... }</code></td><td><code>expect { ... }.not_to have_enqueued_job</code></td></tr>
+<tr><td><code>assert_in_delta n, x, delta</code></td><td><code>expect(x).to be_within(delta).of(n)</code></td></tr>
+</table>
+<p>Two-condition Minitest checks like <code>assert_enqueued_with(...) { assert_difference(...) { ... } }</code> or <code>assert_no_difference [ "A.count", "B.count" ] { ... }</code> became nested <code>expect { }.to</code> blocks (the inner block runs as part of the outer matcher evaluating its block) rather than a single combined matcher - kept the same nesting shape as the original rather than inventing a new style.</p>
+
+<h4>A real bug caught along the way</h4>
+<p>The first pass at the converted specs defined shared constants like <code>EVENTS_URL = "..."</code> directly inside <code>RSpec.describe</code> blocks (mirroring how the Minitest versions declared them as class constants). This doesn't work the same way in RSpec: a constant assignment inside a <code>describe</code> block's body attaches to the top-level <code>Object</code> namespace, not to the block. Running the full suite surfaced this immediately as a Ruby warning - <code>already initialized constant EVENTS_URL</code> - once a second spec file (<code>ingest_cycle_spec.rb</code>, then <code>github_ingest_job_spec.rb</code>) defined the same name. Fixed by converting each to a lowercase helper method (<code>def events_url; "..."; end</code>) instead, matching the style already used for <code>user_url</code>/<code>repo_url</code> elsewhere in the same files - method-scoped, no cross-file leakage, and it also made a follow-up <code>sed</code>-based rename safe to grep-verify (macOS's <code>sed</code> doesn't support <code>\b</code> word boundaries, so an initial rename attempt silently left the call sites unchanged in two of the three files - caught by re-grepping for the old name after the edit, then fixed with <code>perl -pi -e</code> instead).</p>
+
+<h4>Verification</h4>
+<ul>
+  <li><code>bin/rspec</code> on the host against local Postgres - 78 examples, 0 failures, matching the Minitest suite's final count (78 tests/214 assertions) example-for-example.</li>
+  <li><code>bin/rubocop spec/ Gemfile config/ci.rb</code> and <code>bin/brakeman</code> - both clean.</li>
+  <li><code>docker compose run --rm test</code> against a real Docker daemon, from a clean <code>bundle_cache</code> volume - confirmed the container installs the new <code>rspec-rails</code>/<code>strong_migrations</code> gems via the <code>bundle check || bundle install</code> prefix from Phase 8, then runs <code>bin/rspec</code> successfully: 78 examples, 0 failures.</li>
+  <li>Reset local state afterward with <code>docker compose down -v</code> and <code>bin/rails db:reset</code>.</li>
+</ul>
+
+<h3>Logging in <code>GithubIngestJob</code> and <code>Github::IngestCycle</code></h3>
+
+<p>Added an INFO log to <code>GithubIngestJob#perform</code> noting the call, and made every method in <code>Github::IngestCycle</code> log its own result at INFO before returning - not just the four decision branches (<code>poll</code>/<code>enrich</code>/<code>rate_limited</code>/<code>idle</code>), but the lookup/predicate helpers too (<code>rate_limited?</code>, <code>next_allowed_poll_at</code>, <code>oldest_backlog_item</code>), plus <code>call</code> itself. Follows the <code>logger.info("[Github::ClassName] message")</code> convention already used by <code>Github::ApiRequest</code>/<code>PollPushEvents</code>/<code>EnrichUser</code>/<code>EnrichRepository</code>, including the same private <code>def logger; Rails.logger; end</code>.</p>
+
+<h4>What was done</h4>
+<ul>
+  <li><code>app/jobs/github_ingest_job.rb</code>: <code>perform</code> now opens with <code>logger.info("[GithubIngestJob] #perform called")</code> before calling <code>Github::IngestCycle.call</code>. Uses ActiveJob's built-in <code>logger</code> (no need to define one, unlike the plain Ruby service objects).</li>
+  <li><code>app/services/github/ingest_cycle.rb</code>: the original <code>call</code> body (the early-return decision chain from <code>DESIGN.md</code>'s "Deciding what to do this cycle") was moved into a new private <code>decide</code> method, unchanged. <code>call</code> itself became a thin wrapper - run <code>decide</code>, log the resulting <code>Result</code> once, return it - so there's exactly one log line and one exit point for the method that ties the whole cycle together, rather than duplicating a log at each of <code>decide</code>'s four early-return sites.</li>
+  <li>Every other method (<code>rate_limited?</code>, <code>next_allowed_poll_at</code>, <code>oldest_backlog_item</code>, <code>poll</code>, <code>enrich</code>, <code>rate_limited</code>, <code>idle</code>) now computes its result into a local variable, logs it, then returns that same variable - one log statement per method, immediately before its (now single) return.</li>
+  <li>Added <code>private def logger; Rails.logger; end</code> to <code>Github::IngestCycle</code>, matching the other <code>Github::*</code> service objects exactly.</li>
+</ul>
+
+<h4>Verification</h4>
+<ul>
+  <li><code>bin/rspec</code> - still 78 examples, 0 failures; the new logging is additive and doesn't change any method's return value, so the existing spec assertions (all of which check return values/DB state, not log output for this class) needed no changes.</li>
+  <li><code>bin/rubocop</code> and <code>bin/brakeman</code> against both changed files - both clean.</li>
+  <li>Ran <code>GithubIngestJob.perform_now</code> for real (host, local Postgres) twice in a row and read the actual log output rather than just the passing specs: the first run was a cold start and logged <code>[GithubIngestJob] #perform called</code> followed by <code>[Github::IngestCycle] poll complete, request_id=1</code> and <code>[Github::IngestCycle] cycle complete, decision=poll, request_id=1</code>; the second run (budget now near the safety floor from the first run's real GitHub response) logged the <code>rate_limited?</code> branch instead - <code>rate_limited? remaining=3 =&gt; true</code>, <code>rate_limited, ratelimit_reset=...</code>, <code>cycle complete, decision=rate_limited, request_id=</code>. Confirmed both branches log correctly and in the right order before <code>call</code>'s own summary line. Reset the dev database afterward.</li>
+</ul>
+
+<h3>Made <code>RATE_LIMIT_SAFETY_FLOOR</code> configurable via the environment</h3>
+
+<p>The rate-limit safety floor from <code>Github::IngestCycle</code> (design's "a safety floor (e.g. 5)") was a bare constant, requiring a code change and redeploy to try a different value. Made it overridable via a <code>RATE_LIMIT_SAFETY_FLOOR</code> env var, defaulting to <code>5</code> to preserve existing behavior when unset.</p>
+
+<h4>What was done</h4>
+<ul>
+  <li>Initially read <code>ENV</code> directly inside <code>ingest_cycle.rb</code>; asked to route it through Rails config instead, so application code doesn't call <code>ENV</code> directly - centralized instead.</li>
+  <li><code>config/application.rb</code>: added <code>config.x.github.rate_limit_safety_floor = Integer(ENV.fetch("RATE_LIMIT_SAFETY_FLOOR", 5))</code>, using Rails' built-in <code>config.x</code> namespace for custom app-level config (no initializer/plugin needed - <code>config.x</code> is exactly what it's for). <code>Integer(...)</code> rather than <code>.to_i</code> deliberately - a garbled env var value fails loudly at boot instead of silently coercing to <code>0</code> and disabling the safety floor entirely.</li>
+  <li><code>app/services/github/ingest_cycle.rb</code>: <code>RATE_LIMIT_SAFETY_FLOOR</code> now reads <code>Rails.application.config.x.github.rate_limit_safety_floor</code> instead of a bare literal - the constant itself is unchanged everywhere else in the class (still just <code>RATE_LIMIT_SAFETY_FLOOR</code> in <code>rate_limited?</code>), only where its value comes from changed.</li>
+</ul>
+
+<h4>Verification</h4>
+<ul>
+  <li><code>bin/rails runner "puts Github::IngestCycle::RATE_LIMIT_SAFETY_FLOOR"</code> - printed <code>5</code> unset, and <code>RATE_LIMIT_SAFETY_FLOOR=2 bin/rails runner "..."</code> printed <code>2</code>, confirming the override actually reaches the constant through the config layer.</li>
+  <li><code>bin/rspec</code> - still 78 examples, 0 failures; <code>ingest_cycle_spec.rb</code>'s existing "does nothing and reports rate_limited when the remaining budget is at or below the safety floor" test already exercises the default value of <code>5</code> end-to-end, so no test changes were needed for this.</li>
+  <li><code>bin/rubocop</code> and <code>bin/brakeman</code> against both changed files - both clean.</li>
+</ul>
+
+<h3>Standardized "FETCH &lt;type&gt;" log line in <code>Github::ApiRequest</code></h3>
+
+<p>Added an INFO-level <code>[Github::ApiRequest] FETCH &lt;type&gt;</code> log line at the one place all three purposes (poll, enrich a repository, enrich a user) actually make their HTTP call - <code>Github::ApiRequest#fetch</code>, the single choke point <code>PollPushEvents</code>/<code>EnrichRepository</code>/<code>EnrichUser</code> already share. A standardized, grep-able line makes it easy to see the ratio of events/repos/users actually being fetched in a given window, which is exactly the signal needed to judge whether <code>RATE_LIMIT_SAFETY_FLOOR</code> is set well for how the backlog is behaving.</p>
+
+<h4>What was done</h4>
+<ul>
+  <li>Added <code>OBJECT_TYPES = { poll: "events", enrich_repo: "repos", enrich_user: "users" }.freeze</code> to <code>Github::ApiRequest</code>, mapping <code>Request#purpose</code>'s existing enum values (already the exact set every caller passes) to the object-type name for the log line - no new vocabulary introduced, just labels for values that already exist.</li>
+  <li><code>fetch</code> now logs <code>logger.info("[Github::ApiRequest] FETCH #{object_type}")</code> alongside (not instead of) the existing <code>logger.debug("[Github::ApiRequest] fetching #{uri} (purpose=#{purpose})")</code> line - the DEBUG line still carries the full URI/purpose detail from the design's original logging plan; this INFO line is a new, deliberately terse, consistently-shaped addition for skimming/grepping logs at the volume level, not a replacement.</li>
+</ul>
+
+<h4>Verification</h4>
+<ul>
+  <li><code>bin/rspec</code> - still 78 examples, 0 failures; purely additive logging, no return values changed.</li>
+  <li><code>bin/rubocop</code> and <code>bin/brakeman</code> - both clean.</li>
+  <li>Ran <code>GithubIngestJob.perform_now</code> for real (host, local Postgres) and grepped the output for <code>FETCH</code> - confirmed <code>[Github::ApiRequest] FETCH events</code> appears on a real poll cycle. Reset the dev database afterward.</li>
+</ul>
+
 </body>
 </html>

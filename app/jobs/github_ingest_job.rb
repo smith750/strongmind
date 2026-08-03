@@ -39,6 +39,7 @@ class GithubIngestJob < ApplicationJob
   end
 
   def perform
+    logger.info("[GithubIngestJob] #perform called")
     result = Github::IngestCycle.call
     self.class.set(wait: self.class.wait_for(result)).perform_later
   end

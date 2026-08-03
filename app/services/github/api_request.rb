@@ -12,6 +12,11 @@ module Github
   class ApiRequest
     Result = Struct.new(:response, :request, keyword_init: true)
 
+    # Maps Request#purpose to a standardized object-type name for the "FETCH <type>"
+    # log line - grep-able so the ratio of events/repos/users fetched is easy to see,
+    # to help tune the RATE_LIMIT_SAFETY_FLOOR env var (see Github::IngestCycle).
+    OBJECT_TYPES = { poll: "events", enrich_repo: "repos", enrich_user: "users" }.freeze
+
     def self.call(uri:, purpose:, etag: nil)
       new(uri: uri, purpose: purpose, etag: etag).call
     end
@@ -38,6 +43,7 @@ module Github
 
     def fetch
       logger.debug("[Github::ApiRequest] fetching #{uri} (purpose=#{purpose})")
+      logger.info("[Github::ApiRequest] FETCH #{object_type}")
 
       http_request = Net::HTTP::Get.new(uri)
       http_request["Accept"] = "application/vnd.github+json"
@@ -69,6 +75,10 @@ module Github
         purpose: purpose,
         status_code: status
       )
+    end
+
+    def object_type
+      OBJECT_TYPES.fetch(purpose)
     end
 
     def logger

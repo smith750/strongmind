@@ -28,5 +28,9 @@ module Strongmind
     # Middleware like session, flash, cookies can be added back manually.
     # Skip views, helpers and assets when generating a new resource.
     config.api_only = true
+
+    # Custom app config (config.x namespace) - centralizes ENV reads here instead of
+    # scattering ENV calls through application code. See Github::IngestCycle.
+    config.x.github.rate_limit_safety_floor = Integer(ENV.fetch("RATE_LIMIT_SAFETY_FLOOR", 5))
   end
 end

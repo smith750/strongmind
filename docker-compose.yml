@@ -99,7 +99,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    command: bash -c "bundle check || bundle install && bin/rails db:prepare && bin/rails test"
+    command: bash -c "bundle check || bundle install && bin/rails db:prepare && bin/rspec"
     volumes:
       - .:/rails
       - bundle_cache:/usr/local/bundle
