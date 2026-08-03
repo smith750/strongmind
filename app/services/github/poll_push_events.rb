@@ -1,5 +1,3 @@
-require "net/http"
-
 module Github
   # Pulls one page of GitHub's public /events feed, saves a Request record describing
   # the response (for rate-limit/etag tracking - see docs/DESIGN.md "Rate limits"), and
@@ -12,15 +10,12 @@ module Github
     end
 
     def call
-      response = fetch_events
-      return unless response
+      result = ApiRequest.call(uri: uri, purpose: :poll, etag: last_etag)
+      return unless result
 
-      request = persist_request(response)
-      return unless request
+      process_events(result.response.body) if result.response.code.to_i == 200
 
-      process_events(response.body) if response.code.to_i == 200
-
-      request
+      result.request
     end
 
     private
@@ -29,43 +24,8 @@ module Github
       @uri ||= URI("#{EVENTS_URL}?per_page=100")
     end
 
-    def fetch_events
-      logger.debug("[Github::PollPushEvents] fetching #{uri}")
-
-      request = Net::HTTP::Get.new(uri)
-      request["Accept"] = "application/vnd.github+json"
-      request["If-None-Match"] = last_etag if last_etag.present?
-
-      Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(request) }
-    rescue StandardError => e
-      logger.error("[Github::PollPushEvents] request failed: #{e.class}: #{e.message}")
-      nil
-    end
-
     def last_etag
       Request.where(purpose: :poll).order(created_at: :desc).first&.etag
-    end
-
-    def persist_request(response)
-      status = response.code.to_i
-
-      if status >= 500
-        logger.error("[Github::PollPushEvents] request failed with status #{status}")
-        return nil
-      end
-
-      logger.info("[Github::PollPushEvents] request successful, status=#{status}")
-
-      Request.create!(
-        url: uri.to_s,
-        etag: response["ETag"],
-        retry_after: response["Retry-After"],
-        ratelimit_remaining: response["X-RateLimit-Remaining"],
-        ratelimit_reset: response["X-RateLimit-Reset"],
-        poll_interval: response["X-Poll-Interval"] || 0,
-        purpose: :poll,
-        status_code: status
-      )
     end
 
     def process_events(body)

@@ -152,7 +152,55 @@
 <h3>Testing</h3>
 <p>Added <code>webmock</code> (test group only) to stub <code>Net::HTTP</code> at the socket level — per the design's "we will always mock requests in tests" — and wired <code>require "webmock/minitest"</code> plus <code>WebMock.disable_net_connect!</code> into <code>test/test_helper.rb</code> so any un-stubbed request fails loudly instead of hitting the real GitHub API. <code>test/services/github/poll_push_events_test.rb</code> covers: the <code>per_page=100</code> query param, saving a <code>PushEvent</code> per <code>PushEvent</code>-typed entry while ignoring other types, idempotency on a repeated <code>github_event_id</code>, WARN + skip on a missing <code>id</code>, the <code>Request</code> row's captured headers (etag, rate-limit remaining/reset, poll interval, status code), <code>poll_interval</code> defaulting to 0 when the header is absent, sending <code>If-None-Match</code> from the last poll's etag, a 304 short-circuiting before body parsing, and ERROR logging (with no <code>Request</code> row) on both a 5xx response and a raised network exception. 10 tests, 41 assertions, all green — 34 tests/82 assertions across the whole suite. <code>bin/rubocop</code> and <code>bin/brakeman</code> both clean against the new files.</p>
 
-<h2>Phase 3 — Pull contributors <span class="status pending">pending</span></h2>
+<h2>Phase 3 — Pull contributors <span class="status done">done</span></h2>
+
+<p>Before starting Phase 3, extracted the conditional-GET-plus-Request-persistence mechanics that <code>Github::PollPushEvents</code> (Phase 2) already had into a shared <code>Github::ApiRequest</code> (<code>app/services/github/api_request.rb</code>). <code>Github::EnrichUser</code> needed the exact same mechanics the design's "Continuous Ingestion" section already frames as one shared shape - "at most one HTTP request per call (poll, enrich a repository, or enrich a user)" - and Phase 4's repository enrichment is the same shape again, so extracting now rather than duplicating it a second and third time seemed like the right call. <code>Github::ApiRequest.call(uri:, purpose:, etag:)</code> performs the GET (with <code>If-None-Match</code> if an etag was given), rescues network errors, and persists the <code>Request</code> row - returning <code>nil</code> on any failure (network exception or 5xx) or a <code>Result</code> wrapping the raw response and the persisted <code>Request</code> otherwise. <code>PollPushEvents</code> was refactored to call it; its own Phase 2 tests were re-run unchanged afterward to confirm behavior didn't shift.</p>
+
+<p>Built <code>Github::EnrichUser</code> (<code>app/services/github/enrich_user.rb</code>): given a single <code>PushEvent</code> that still needs its author resolved, it implements the design's "Fan Out" paragraph for contributors. It looks up whether a <code>User</code> already exists for that push event's <code>github_actor_id</code>, makes one conditional GET against GitHub's "get a user by id" endpoint (<code>GET /user/{id}</code>) using that user's <code>last_etag</code> if there is one, and then either links the push event to the (possibly just-created or just-refreshed) <code>User</code>, or - on a 4xx - marks the push event <code>user_unenrichable</code> so it permanently drops out of the backlog Phase 5 will query. Selecting <em>which</em> backlog push event to hand to this service is still Phase 5's job; this service only knows how to resolve one.</p>
+
+<h3>Design decisions</h3>
+<table>
+<tr><th>Area</th><th>Decision</th><th>Why</th></tr>
+<tr>
+  <td>Endpoint</td>
+  <td><code>GET https://api.github.com/user/{github_actor_id}</code> (the numeric-id form), not <code>/users/{login}</code>.</td>
+  <td>The design deliberately stores only <code>github_actor_id</code> on <code>PushEvent</code>, not a login or URL - GitHub's REST API has a dedicated "get a user using their ID" endpoint for exactly this, so no extra field or lookup is needed.</td>
+</tr>
+<tr>
+  <td>Conditional request, always</td>
+  <td>Every enrichment attempt makes one request - fresh if no local <code>User</code> exists yet, conditional (<code>If-None-Match</code> from <code>last_etag</code>) if one does. A known contributor is never skipped/linked for free without a request.</td>
+  <td>Taken literally from the design's Fan Out wording: "If we haven't, we will pull the information. If we have, we'll use the etag... to do a conditional request" - both branches make a request, they just differ in whether it's conditional. This also matches Phase 5's one-cycle-one-request model.</td>
+</tr>
+<tr>
+  <td>Deduplicating contributors</td>
+  <td>Looked up by <code>github_user_id</code> and updated in place (<code>find_by</code> + <code>assign_attributes</code>/<code>save!</code>), never a second row for the same id - a repeat 304 or 200 for an already-known contributor still just links the existing row.</td>
+  <td>Design: "we're going to see if we have already saved that information in the database" before deciding how to request it - the whole point is one <code>User</code> row per contributor no matter how many of their push events get enriched over time.</td>
+</tr>
+<tr>
+  <td>4xx handling</td>
+  <td>Sets <code>user_unenrichable = true</code> on the push event and does not touch the <code>User</code> table; the <code>Request</code> row is still persisted (it's a real response, not a failure to get one).</td>
+  <td>Design: "If the request was meant to enrich a user or repository and the response was a 4xx error, then set the corresponding... field... and do not attempt again."</td>
+</tr>
+<tr>
+  <td>5xx / network failure handling</td>
+  <td>No <code>Request</code> row, push event untouched (still eligible for the backlog next cycle), ERROR logged.</td>
+  <td>Same "Error thrown... catch immediately, log ERROR, move on" rule Phase 2 already applied to the poll request - a transient failure isn't the same as a permanent 4xx, so it shouldn't set <code>user_unenrichable</code>.</td>
+</tr>
+<tr>
+  <td>Missing <code>github_actor_id</code></td>
+  <td>Immediately marks the push event <code>user_unenrichable</code>, logs WARN, makes no HTTP call at all.</td>
+  <td>Not explicitly in the design, but a necessary edge case: without an id there's no endpoint to call, and leaving it enrichable would mean this row sits in the Phase 5 backlog query forever, wasting a cycle every time it's picked. This is the same purpose the <code>_unenrichable</code> flags already serve for real 4xx responses.</td>
+</tr>
+<tr>
+  <td>Guard clauses</td>
+  <td><code>call</code> is a no-op (no HTTP call) if the push event already has an <code>author_id</code> or is already <code>user_unenrichable</code>.</td>
+  <td>Phase 5's backlog query already filters these out before this service is ever invoked, but making the service itself idempotent/safe to call directly keeps it independently testable and correct if invoked outside that query.</td>
+</tr>
+</table>
+
+<h3>Testing</h3>
+<p><code>test/services/github/enrich_user_test.rb</code> covers: creating a new <code>User</code> and linking it on a fresh 200, sending no <code>If-None-Match</code> when nothing is known yet, sending it (and linking without creating a duplicate) when a <code>User</code> is already known and GitHub returns 304, updating an existing <code>User</code>'s fields in place when a 200 comes back with changed data, two push events by the same author converging on one <code>User</code> row, marking <code>user_unenrichable</code> (with the <code>Request</code> still persisted) on a 4xx, ERROR logging with no <code>Request</code> row and no state change on a network failure, the blank-<code>github_actor_id</code> guard (WARN, zero HTTP calls), and the two already-enriched/already-<code>unenrichable</code> no-op guards. 11 tests, 42 assertions, all green - 45 tests/124 assertions across the whole suite. <code>bin/rubocop</code> and <code>bin/brakeman</code> both clean.</p>
+
 <h2>Phase 4 — Pull repositories <span class="status pending">pending</span></h2>
 <h2>Phase 5 — <code>Github::IngestCycle</code> budget/backlog logic <span class="status pending">pending</span></h2>
 <h2>Phase 6 — Rake task ("repeatable") <span class="status pending">pending</span></h2>
