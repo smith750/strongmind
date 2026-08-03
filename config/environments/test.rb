@@ -22,6 +22,11 @@ Rails.application.configure do
   config.consider_all_requests_local = true
   config.cache_store = :null_store
 
+  # SolidQueue::Job and friends need this to resolve the "queue" role configured
+  # in database.yml; without it they fall back to the primary connection, where
+  # the solid_queue_* tables don't exist.
+  config.solid_queue.connects_to = { database: { writing: :queue } }
+
   # Render exception templates for rescuable exceptions and raise for other exceptions.
   config.action_dispatch.show_exceptions = :rescuable
 
