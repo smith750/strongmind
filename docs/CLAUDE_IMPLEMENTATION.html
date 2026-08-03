@@ -274,7 +274,35 @@
 <h3>Testing</h3>
 <p><code>test/services/github/ingest_cycle_test.rb</code> covers: cold start (zero <code>Request</code> rows) polling immediately, the rate-limit floor short-circuiting with zero HTTP calls, polling once the poll interval has elapsed, falling through to enrichment when it hasn't, prioritizing repository enrichment over user enrichment for an item needing both (asserting the user endpoint is never requested that cycle), picking the globally oldest backlog item ahead of a newer one, idling when nothing is due, and excluding a push event that's <code>_unenrichable</code> on both sides from ever reappearing in the backlog. 8 tests, 22 assertions, all green - 64 tests/188 assertions across the whole suite. <code>bin/rubocop</code> and <code>bin/brakeman</code> both clean.</p>
 
-<h2>Phase 6 — Rake task ("repeatable") <span class="status pending">pending</span></h2>
+<h2>Phase 6 — Rake task ("repeatable") <span class="status done">done</span></h2>
+
+<p>Built <code>lib/tasks/ingest.rake</code>, defining <code>ingest:once</code> - the "repeatable" entry point from the design's "Continuous Ingestion" section. It's intentionally thin: depend on <code>:environment</code>, call <code>Github::IngestCycle.call</code> exactly once, log the decision, and let Rake exit normally. All of the actual behavior (what to do, rate limiting, backlog priority) already lives in <code>Github::IngestCycle</code> (Phase 5) and the service objects underneath it - this task has nothing to decide. This is also the task Phase 8's <code>ingest</code> Docker Compose service will run via <code>bin/rails ingest:once</code>.</p>
+
+<h3>Design decisions</h3>
+<table>
+<tr><th>Area</th><th>Decision</th><th>Why</th></tr>
+<tr>
+  <td>Task body</td>
+  <td>Three lines: call <code>Github::IngestCycle.call</code>, log <code>"[ingest:once] cycle complete, decision=#{result.decision}"</code>, done. No loop, no sleep, no rescue wrapper.</td>
+  <td>Design: "a rake task (<code>ingest</code>) calls <code>Github::IngestCycle</code> directly and synchronously, once, then exits." Looping/rescheduling is explicitly the continuous job's job (Phase 7), not this task's.</td>
+</tr>
+<tr>
+  <td>No top-level rescue</td>
+  <td>An unexpected exception (e.g. a real bug, DB unreachable) is allowed to propagate and exit the task non-zero.</td>
+  <td>Every failure mode the design actually anticipates (network errors, GitHub 4xx/5xx, unparseable JSON) is already caught and logged several layers down, inside <code>PollPushEvents</code>/<code>EnrichUser</code>/<code>EnrichRepository</code>/<code>ApiRequest</code> (Phases 2-5). A truly unexpected exception reaching this task means something outside those anticipated cases broke, and a one-shot task run via <code>docker compose run --rm ingest</code> should surface that as a visible failure rather than exit 0 silently.</td>
+</tr>
+<tr>
+  <td>STDOUT logging in development</td>
+  <td>No change needed.</td>
+  <td>The design's "Docker / Rails wiring this requires" section flags <code>config/environments/development.rb</code> as needing a STDOUT logger fix so <code>docker compose logs -f</code> shows this task's output. Checked it while building this phase: this Rails 8.1 app's generated <code>development.rb</code> already sets <code>config.logger = ActiveSupport::TaggedLogging.logger(STDOUT)</code> (line 80) out of the box - that concern predates this scaffold's Rails version and doesn't apply here.</td>
+</tr>
+</table>
+
+<h3>Testing</h3>
+<p><code>test/tasks/ingest_task_test.rb</code> loads the app's Rake tasks once at file load and re-enables <code>ingest:once</code> before each test (Rake tasks otherwise only run once per process). Covers: invoking <code>Github::IngestCycle</code> exactly once on a cold start (asserted via a <code>Request</code> row appearing), the decision being logged, and an idle cycle making zero HTTP calls. 3 tests, 5 assertions, all green - 67 tests/193 assertions across the whole suite. <code>bin/rubocop</code> and <code>bin/brakeman</code> both clean.</p>
+
+<p>Also ran <code>bin/rails ingest:once</code> for real against the live (unauthenticated) GitHub API and the local dev database - not just the mocked test suite - to confirm the whole chain actually works end to end: it polled <code>https://api.github.com/events</code>, persisted a <code>Request</code> with the real <code>ETag</code>/rate-limit headers GitHub returned, saved 97 real <code>PushEvent</code> rows, and logged <code>[ingest:once] cycle complete, decision=poll</code>. Reset the dev database back to empty afterward.</p>
+
 <h2>Phase 7 — Solid Queue job ("continuous") <span class="status pending">pending</span></h2>
 <h2>Phase 8 — Docker Compose wiring <span class="status pending">pending</span></h2>
 
