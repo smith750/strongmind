@@ -100,7 +100,58 @@
 <strong>Environment note:</strong> Docker wasn't running in this session, so migrations and tests were run directly against the host's local Postgres (already running, matching Ruby 4.0.6 via rbenv) using env var overrides — <code>DATABASE_HOST=localhost DATABASE_USERNAME=james DATABASE_PASSWORD=</code> — rather than the <code>postgres</code>/<code>postgres</code> credentials <code>config/database.yml</code> defaults to for the Docker Compose setup. This only affected how the databases were reached this session; no application or config code was changed to accommodate it, and the Docker Compose path (<code>db</code> service with <code>postgres</code>/<code>postgres</code>) is untouched and still what Phase 8 will wire up end-to-end.
 </div>
 
-<h2>Phase 2 — Pull service object (page of pushes) <span class="status pending">pending</span></h2>
+<h2>Phase 2 — Pull service object (page of pushes) <span class="status done">done</span></h2>
+
+<p>Built <code>Github::PollPushEvents</code> (<code>app/services/github/poll_push_events.rb</code>), the "Pull Service Object" from the design's poll path: it makes one GET to <code>https://api.github.com/events?per_page=100</code>, records a <code>Request</code> row describing the response, and saves a <code>PushEvent</code> for every entry whose <code>type</code> is <code>"PushEvent"</code>. Everything else in the design's "Rate limits" and "Pull Service Object" sections that this request touches — conditional <code>If-None-Match</code>, per-field extraction, the logging plan, catch-and-continue on request errors — is implemented here. The budget/backlog <em>decision</em> of when to poll vs. enrich (<code>Github::IngestCycle</code>) is still Phase 5; this service object only knows how to do the poll action itself, and returns the <code>Request</code> it created so a future caller can use it.</p>
+
+<h3>Design decisions</h3>
+<table>
+<tr><th>Area</th><th>Decision</th><th>Why</th></tr>
+<tr>
+  <td>HTTP client</td>
+  <td>Plain <code>Net::HTTP</code>, no HTTP client gem.</td>
+  <td>One GET request with a couple of headers doesn't need a dependency; stdlib is enough and keeps the service object's only real collaborator visible in the code itself.</td>
+</tr>
+<tr>
+  <td>Conditional requests</td>
+  <td>Before the request, look up the most recent <code>Request</code> row where <code>purpose = poll</code> and send its <code>etag</code> as <code>If-None-Match</code>, if present.</td>
+  <td>Matches the design's "Rate limits" section directly: use the last etag so an unchanged feed comes back as a cheap 304.</td>
+</tr>
+<tr>
+  <td>Idempotency across polls</td>
+  <td><code>PushEvent.find_or_create_by!(github_event_id: ...)</code> rather than a plain <code>create!</code>.</td>
+  <td>GitHub's public <code>/events</code> feed is a rolling window, so consecutive polls overlap — the same event shows up more than once. The design gives <code>github_event_id</code> a uniqueness constraint but doesn't say what to do about that overlap; treating a repeat as a no-op (not a WARN/ERROR) is the natural read, since it's expected steady-state behavior, not a failure.</td>
+</tr>
+<tr>
+  <td>Malformed/unparseable events</td>
+  <td>A <code>PushEvent</code>-typed entry missing <code>id</code> is logged at WARN and skipped; every other field is optional on the model, so nothing else about an event can make it unsavable.</td>
+  <td>Design: "if the JSON for the event cannot be parsed and we cannot add all of the fields from the PushEvent, then we will log it as WARN, and continue to the next event." <code>github_event_id</code> is the only field the schema actually requires.</td>
+</tr>
+<tr>
+  <td>Request-level failures</td>
+  <td>A raised exception from <code>Net::HTTP</code> (network failure) and a 5xx HTTP response are both treated as request failures: logged at ERROR, no <code>Request</code> row written, method returns early with nothing saved.</td>
+  <td>Design: "If a request leads to an Error being thrown, we will catch it immediately, log it as an ERROR, and move on." Also matches the later "Continuous Ingestion" note that 5xx/network failures don't get a <code>Request</code> row (only real responses with real headers do) — kept consistent here since it's the same rule applied to the same kind of request.</td>
+</tr>
+<tr>
+  <td>304 responses</td>
+  <td>A <code>Request</code> row is still written (it has real headers/rate-limit info worth keeping), but the body is never parsed and no <code>PushEvent</code> work happens.</td>
+  <td>A 304 means "nothing changed" — there's no body to speak of, but the rate-limit bookkeeping from that response is still the freshest we have.</td>
+</tr>
+<tr>
+  <td>Logging</td>
+  <td>DEBUG before the fetch; INFO once the response comes back successfully; per push-event INFO ("parsed") / WARN (unparseable) followed by an INFO ("saved") once persisted; ERROR on request failure (network exception, 5xx, or unparseable JSON body).</td>
+  <td>Follows the design's logging plan (a–d in "Pull Service Object") point for point.</td>
+</tr>
+<tr>
+  <td><code>full_info</code></td>
+  <td>Stores <code>event.to_json</code> — the exact JSON object for that event as GitHub returned it, re-serialized — rather than a hand-picked subset.</td>
+  <td>Design: store the full object JSON on each model so more fields can be added later without re-pulling. Applies to <code>PushEvent</code> the same way Phase 1 already applied it to <code>Repository</code>/<code>User</code>.</td>
+</tr>
+</table>
+
+<h3>Testing</h3>
+<p>Added <code>webmock</code> (test group only) to stub <code>Net::HTTP</code> at the socket level — per the design's "we will always mock requests in tests" — and wired <code>require "webmock/minitest"</code> plus <code>WebMock.disable_net_connect!</code> into <code>test/test_helper.rb</code> so any un-stubbed request fails loudly instead of hitting the real GitHub API. <code>test/services/github/poll_push_events_test.rb</code> covers: the <code>per_page=100</code> query param, saving a <code>PushEvent</code> per <code>PushEvent</code>-typed entry while ignoring other types, idempotency on a repeated <code>github_event_id</code>, WARN + skip on a missing <code>id</code>, the <code>Request</code> row's captured headers (etag, rate-limit remaining/reset, poll interval, status code), <code>poll_interval</code> defaulting to 0 when the header is absent, sending <code>If-None-Match</code> from the last poll's etag, a 304 short-circuiting before body parsing, and ERROR logging (with no <code>Request</code> row) on both a 5xx response and a raised network exception. 10 tests, 41 assertions, all green — 34 tests/82 assertions across the whole suite. <code>bin/rubocop</code> and <code>bin/brakeman</code> both clean against the new files.</p>
+
 <h2>Phase 3 — Pull contributors <span class="status pending">pending</span></h2>
 <h2>Phase 4 — Pull repositories <span class="status pending">pending</span></h2>
 <h2>Phase 5 — <code>Github::IngestCycle</code> budget/backlog logic <span class="status pending">pending</span></h2>
