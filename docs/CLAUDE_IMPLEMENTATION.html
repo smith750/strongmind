@@ -402,5 +402,28 @@ Fixed by adding a <code>queue</code> role to <code>database.yml</code> for both 
   <li>Reset local state afterward with <code>docker compose down -v</code> so the repo is left exactly as a reviewer's clean checkout would find it - no leftover containers, volumes, or local Postgres data from this session's testing.</li>
 </ul>
 
+<h2>Miscellaneous</h2>
+<p>Items handled outside the phased build above, one subsection per item, added as each is completed.</p>
+
+<h3>Added <code>strong_migrations</code> gem</h3>
+
+<p>Added the <a href="https://github.com/ankane/strong_migrations"><code>strong_migrations</code></a> gem, which raises in development when a migration would take a dangerous lock or run an unsafe operation against Postgres (e.g. adding a column with a non-null default pre-11, backfilling in the same migration as an index add, etc.) - catches these at <code>db:migrate</code> time in development instead of finding out during a slow/locking production deploy.</p>
+
+<h4>What was done</h4>
+<ul>
+  <li>Added <code>gem "strong_migrations"</code> to the <code>Gemfile</code> (no group restriction - it needs to hook into <code>ActiveRecord::Migration</code> in every environment migrations can run in, including the <code>migrate</code>/<code>ingest</code>/<code>test</code> Docker Compose services from Phase 8, not just development).</li>
+  <li>Ran <code>bin/rails generate strong_migrations:install</code>, which created <code>config/initializers/strong_migrations.rb</code> with the gem's defaults (<code>lock_timeout: 10.seconds</code>, <code>statement_timeout: 1.hour</code>, <code>auto_analyze: true</code>) and set <code>StrongMigrations.start_after</code> to the current timestamp - this marks all four existing migrations (<code>20260802235742</code>-<code>20260802235751</code>) as pre-existing/safe, so the gem only checks migrations written from here on, not the ones already reviewed and shipped in Phases 1-4.</li>
+</ul>
+
+<h4>Verification</h4>
+<p>Not just a bundle install - actually exercised migrations running through the gem's hooks, on the host against local Postgres (<code>DATABASE_HOST=localhost DATABASE_USERNAME=james DATABASE_PASSWORD=</code>, same override Phase 1 used):</p>
+<ul>
+  <li><code>bin/rails db:drop db:create db:migrate</code>, twice, from a fully empty database each time - the primary database's four migrations ran clean (<code>db:migrate:status</code> showed all four <code>up</code> with no <code>strong_migrations</code> output or errors). This runs migrations via <code>MigrationContext#migrate</code>, not <code>db:schema:load</code>, so it's the actual code path <code>strong_migrations</code> hooks into, not the schema-dump fast path.</li>
+  <li><code>bin/rails test</code> - 78 runs, 214 assertions, 0 failures, matching the pre-existing suite exactly (the gem doesn't touch runtime model/service code, only migration execution).</li>
+  <li><code>bin/rubocop</code> and <code>bin/brakeman</code> against the <code>Gemfile</code> and the new initializer - both clean.</li>
+  <li>Reset the dev/test databases back to their normal state afterward with <code>bin/rails db:reset</code> and <code>bin/rails db:test:prepare</code>.</li>
+</ul>
+<p>No unsafe operations were flagged - expected, since none of the four existing migrations do anything the gem checks for (they're all <code>create_table</code>, which <code>strong_migrations</code> doesn't flag) and they predate <code>start_after</code> regardless.</p>
+
 </body>
 </html>
