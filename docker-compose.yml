@@ -14,11 +14,29 @@ services:
       timeout: 5s
       retries: 5
 
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: bash -c "bundle check || bundle install && bin/rails db:prepare"
+    volumes:
+      - .:/rails
+      - bundle_cache:/usr/local/bundle
+    environment:
+      RAILS_ENV: development
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+    depends_on:
+      db:
+        condition: service_healthy
+
   web:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    command: bash -c "bin/rails db:prepare && bin/rails server -b 0.0.0.0"
+    command: bash -c "bundle check || bundle install && bin/rails server -b 0.0.0.0"
     volumes:
       - .:/rails
       - bundle_cache:/usr/local/bundle
@@ -33,8 +51,68 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     stdin_open: true
     tty: true
+
+  jobs:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: bash -c "bundle check || bundle install && bin/rails runner 'GithubIngestJob.ensure_running' && bin/jobs"
+    volumes:
+      - .:/rails
+      - bundle_cache:/usr/local/bundle
+    environment:
+      RAILS_ENV: development
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: bash -c "bundle check || bundle install && bin/rails db:prepare && bin/rails ingest:once"
+    volumes:
+      - .:/rails
+      - bundle_cache:/usr/local/bundle
+    environment:
+      RAILS_ENV: development
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: bash -c "bundle check || bundle install && bin/rails db:prepare && bin/rails test"
+    volumes:
+      - .:/rails
+      - bundle_cache:/usr/local/bundle
+    environment:
+      RAILS_ENV: test
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["tools"]
 
 volumes:
   postgres_data:

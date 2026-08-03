@@ -352,7 +352,55 @@ Fixed by adding a <code>queue</code> role to <code>database.yml</code> for both 
 <strong>Known local-environment issue: <code>bin/jobs</code> itself segfaults on this machine.</strong> Running the actual <code>bin/jobs</code> Solid Queue supervisor (which forks separate dispatcher/worker processes) crashed with a segmentation fault inside the <code>pg</code> gem's native C extension (<code>connect_start</code>), triggered while a freshly-forked child process tried to open its own Postgres connection. This reproduced consistently and is a known general class of issue with the <code>pg</code> gem/libpq and <code>fork()</code> (particularly around OpenSSL state) - not a bug in <code>GithubIngestJob</code>, <code>Github::IngestCycle</code>, or any other Phase 1-7 code: the identical logic ran correctly, twice in a row, with no fork involved (<code>perform_now</code> above), and the full mocked test suite (which also never forks) is green. This is almost certainly specific to this machine's Ruby/pg/macOS build (a very recent Ruby patch revision) and not expected to reproduce inside the Linux container Phase 8 will run <code>bin/jobs</code> in - but it's worth being aware of if <code>bin/jobs</code> needs to run directly on this host again outside Docker.
 </div>
 
-<h2>Phase 8 — Docker Compose wiring <span class="status pending">pending</span></h2>
+<h2>Phase 8 — Docker Compose wiring <span class="status done">done</span></h2>
+
+<p>Added the three services the design's "Docker Compose Wiring" section calls for — <code>jobs</code>, <code>ingest</code>, <code>test</code> — plus one not in the design's original list: <code>migrate</code>, added mid-phase once live testing surfaced a real startup race (see below). All four reuse the same <code>Dockerfile.dev</code> build and <code>DATABASE_*</code>/env shape <code>web</code> already had. Verified against a real Docker daemon on this machine, not just by reading the compose file: built and brought the full stack up from a completely clean volume state (<code>docker compose down -v</code> first) multiple times, ran the live GitHub-ingestion chain for real through <code>jobs</code>, and ran both <code>docker compose run --rm test</code> and <code>docker compose run --rm ingest</code>.</p>
+
+<h3>Design decisions</h3>
+<table>
+<tr><th>Area</th><th>Decision</th><th>Why</th></tr>
+<tr>
+  <td><code>jobs</code></td>
+  <td>Runs <code>bin/jobs</code>, same build/env as <code>web</code>, not profiled — starts automatically under <code>docker compose up --build</code>.</td>
+  <td>Design: "Not profiled - it starts automatically under <code>docker compose up --build</code>, alongside <code>db</code> and <code>web</code>, since continuous ingestion is meant to run unattended as part of 'the system.'"</td>
+</tr>
+<tr>
+  <td><code>ingest</code> / <code>test</code></td>
+  <td>Both given <code>profiles: ["tools"]</code>; each still runs its own <code>bin/rails db:prepare</code> defensively before its real command.</td>
+  <td>Design, verbatim: "<code>profiles: ["tools"]</code> so <code>docker compose up --build</code> doesn't try to start it... <code>docker compose run --rm ingest</code> still works, since <code>run</code> targets a named service explicitly regardless of its profile" and "re-run <code>db:prepare</code> defensively... in case a reviewer runs [it] without having brought <code>docker compose up</code> up first."</td>
+</tr>
+<tr>
+  <td><code>test</code> database</td>
+  <td><code>RAILS_ENV: test</code>, same <code>db</code> container/host, no second Postgres service.</td>
+  <td>Design: "Rails keeps dev and test as separate databases on the same Postgres server via <code>database.yml</code>, so no second database service is needed" — confirmed true here since <code>database.yml</code>'s <code>test:</code> block already points at its own <code>strongmind_test</code>/<code>strongmind_test_queue</code> databases (Phase 1/7).</td>
+</tr>
+<tr>
+  <td>Bundle install on every service command</td>
+  <td>Every service's command is prefixed with <code>bundle check || bundle install &amp;&amp;</code> before the real command, rather than relying solely on the image's build-time <code>RUN bundle install</code>.</td>
+  <td><strong>Found via live testing, not in the design</strong>: <code>web</code>'s named <code>bundle_cache</code> volume is mounted at <code>/usr/local/bundle</code>, which shadows whatever the image's build step installed the moment the volume already existed from an earlier build (e.g. a stale volume from before <code>webmock</code> was added to the Gemfile in Phase 2). Confirmed this concretely: <code>docker compose up --build</code> against the pre-existing local <code>bundle_cache</code> volume failed both <code>web</code> and <code>jobs</code> with <code>Bundler::GemNotFound</code> for <code>webmock</code> and friends, even though the image had just rebuilt with a Gemfile that includes it. This is the same tradeoff the volume was presumably added for in the first place (avoid a full <code>bundle install</code> on every container start) — <code>bundle check</code> keeps that fast path on the common case and only reinstalls when the volume's gem set actually drifts from the Gemfile.lock.</td>
+</tr>
+<tr>
+  <td>New <code>migrate</code> service</td>
+  <td>One-shot service running only <code>bin/rails db:prepare</code>, depended on by <code>web</code> and <code>jobs</code> via <code>condition: service_completed_successfully</code> (in addition to <code>db: condition: service_healthy</code>).</td>
+  <td><strong>Found via live testing, not in the design</strong>: with both <code>web</code> and <code>jobs</code> independently running their own <code>bin/rails db:prepare</code> on container start (needed so either one works if brought up alone), a completely fresh Postgres volume let both processes race to run <code>CREATE DATABASE</code>/schema-load concurrently. Reproduced this directly — a from-scratch <code>docker compose up --build</code> against a freshly-created, empty <code>postgres_data</code> volume failed <code>web</code> with <code>PG::ConnectionBad: FATAL: database "strongmind_development" does not exist</code> while <code>jobs</code>' own concurrent <code>db:prepare</code> was mid-flight. Pulling the one-time "create and migrate everything" step out into its own service that both <code>web</code> and <code>jobs</code> block on is the standard Compose pattern for exactly this - it removes the race entirely rather than papering over it with a retry/sleep. <code>ingest</code> and <code>test</code> don't depend on <code>migrate</code>: they're invoked one at a time via <code>docker compose run --rm</code>, never concurrently with each other or with a fresh <code>web</code>/<code>jobs</code> startup in the reviewer's actual workflow, so they keep their own standalone-safe <code>db:prepare</code> instead.</td>
+</tr>
+<tr>
+  <td>Bootstrapping the continuous chain on first boot</td>
+  <td><code>jobs</code>' command runs <code>bin/rails runner 'GithubIngestJob.ensure_running'</code> immediately before <code>bin/jobs</code>.</td>
+  <td><strong>Found via live testing, not in the design</strong>: <code>config/recurring.yml</code>'s <code>github_ingest_heartbeat</code> entry (Phase 7) only fires "every hour" - on a fresh <code>docker compose up</code> with zero <code>SolidQueue::Job</code> rows, nothing ever calls <code>GithubIngestJob.perform_later</code> the first time, so the chain would sit completely idle for up to an hour before its first cycle. Confirmed this directly: querying <code>SolidQueue::Job.where(class_name: "GithubIngestJob").count</code> right after a clean <code>docker compose up --build</code> (before this fix) returned <code>0</code>. Design: "if the self-rescheduling chain ever dies from an unhandled error, this re-enqueues" - the heartbeat's own stated job is restarting a dead chain, not starting the first one, so seeding it here doesn't change the heartbeat's role, it just closes the gap of who does the first <code>perform_later</code>. Reused <code>ensure_running</code> (already idempotent/no-op-if-alive from Phase 7) rather than an unconditional <code>perform_later</code>, so re-running <code>docker compose up</code> against an already-running chain doesn't start a second parallel one.</td>
+</tr>
+</table>
+
+<h3>Verification</h3>
+<p>All done against a real Docker daemon on this machine (started fresh for this phase), not just by reading the compose file:</p>
+<ul>
+  <li><code>docker compose up --build -d</code> from a completely clean state (<code>docker compose down -v</code> beforehand, removing both the Postgres data volume and the bundle cache volume) — confirmed only <code>db</code>, <code>migrate</code>, <code>web</code>, <code>jobs</code> start (never <code>ingest</code>/<code>test</code>), <code>migrate</code> exits 0 before <code>web</code>/<code>jobs</code> come up, <code>web</code> serves on <code>:3000</code>, and <code>jobs</code>' Solid Queue supervisor registers its Dispatcher/Worker/Scheduler processes and loads both recurring tasks.</li>
+  <li>Let the continuous chain run for real against the live, unauthenticated GitHub API through several dozen cycles (<code>SolidQueue::Job.where(class_name: "GithubIngestJob").count</code> climbed well past 40) — watched it actually poll, then fall through to enriching real repositories and users, matching <code>Github::IngestCycle</code>'s decision order.</li>
+  <li><code>docker compose run --rm test</code> — 78 runs, 214 assertions, 0 failures, matching the host-run suite exactly.</li>
+  <li><code>docker compose run --rm ingest</code> — ran one real cycle against the live API and logged <code>[ingest:once] cycle complete, decision=...</code>, sharing the same <code>db</code> container/state as the already-running <code>jobs</code> chain.</li>
+  <li>While both <code>jobs</code> and a manually-run <code>ingest</code> were hitting the live backlog concurrently, observed one real <code>Github::EnrichUser</code> race (two processes enriching the same push event's author at once) surface exactly the caught-and-logged path already built in Phase 3: <code>User#save!</code> raised on the DB's unique constraint, <code>save_user</code>'s <code>rescue StandardError</code> logged it as an ERROR and returned the (nil, in this case) <code>existing_user</code>, and the push event's <code>author_id</code> was left <code>nil</code> - so it just gets retried next cycle rather than corrupting anything. Left as-is rather than "fixed": this is the same class of accepted, self-healing race the design's own "Known gap" section already names for the <code>Request</code> table, just showing up in a second place under real concurrent load - not a Phase 8 scope item.</li>
+  <li>Reset local state afterward with <code>docker compose down -v</code> so the repo is left exactly as a reviewer's clean checkout would find it - no leftover containers, volumes, or local Postgres data from this session's testing.</li>
+</ul>
 
 </body>
 </html>

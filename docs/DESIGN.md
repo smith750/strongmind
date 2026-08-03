@@ -152,7 +152,7 @@ The rake task and the continuous chain both read-then-write `Request` rows indep
 6. Build the rake task ("repeatable") that calls `Github::IngestCycle` directly, once, and exits
 7. Build the Solid Queue job ("continuous") that wraps `Github::IngestCycle` and self-reschedules; wire up `bin/jobs` as a docker-compose service and the `recurring.yml` heartbeat entry
 8. Wire up the `ingest` and `test` docker-compose services (and confirm `jobs` starts under `docker compose up --build`) as described in "Docker Compose Wiring" above; verify all three reviewer commands work from a clean checkout
-JAMES HERE Remaining phases: use rspec for tests, copy edit version of this document, log every loop cycle in GithubInjestJob
+JAMES HERE Remaining phases: use rspec for tests, copy edit version of this document, log every loop cycle in GithubInjestJob, strong migrations, environment variable for how many event polls an hour
 
 Every phase will be built using a TDD behavior so we can verify behavior as we complete each step.  Because of Github's request rate limits, we will always mock requests in tests.  We will write integration tests around the use of SolidQueue.
 
