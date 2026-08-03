@@ -32,6 +32,7 @@ module Github
       return unless result
 
       handle_response(result.response, github_actor_id, existing_user)
+      result.request
     end
 
     private

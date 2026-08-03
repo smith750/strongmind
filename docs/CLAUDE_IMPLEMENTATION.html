@@ -227,7 +227,53 @@
 <strong>Environment fix: disabled test parallelization.</strong> Adding this phase's 11 tests pushed the suite from 45 to 56 tests, crossing Rails' default parallel-test threshold (50) for the first time. That activated <code>parallelize(workers: :number_of_processors)</code> in <code>test_helper.rb</code> - 12 workers on this machine, each needing its own cloned test database - and that cloning step hung indefinitely in this environment (confirmed by forcing <code>PARALLEL_WORKERS=1</code>, which ran all 56 tests in 0.17s). Since this suite runs in well under a second single-process and Phase 8's Docker Compose <code>test</code> service will invoke <code>bin/rails test</code> the same way, leaving parallelization on would hand the reviewer the identical hang the moment the suite crossed 50 tests - which it now permanently has. Changed <code>test_helper.rb</code> to <code>parallelize(workers: 1)</code> rather than rely on an env var override reviewers wouldn't know to set.
 </div>
 
-<h2>Phase 5 — <code>Github::IngestCycle</code> budget/backlog logic <span class="status pending">pending</span></h2>
+<h2>Phase 5 — <code>Github::IngestCycle</code> budget/backlog logic <span class="status done">done</span></h2>
+
+<p>Built <code>Github::IngestCycle</code> (<code>app/services/github/ingest_cycle.rb</code>), the decision algorithm from the design's "Continuous Ingestion" section, implemented point-for-point against the numbered list there. It composes the three service objects from Phases 2-4 (<code>PollPushEvents</code>, <code>EnrichRepository</code>, <code>EnrichUser</code>) but makes none of the underlying HTTP calls itself - it only decides which of those three to call, or whether to call none of them this cycle. As the design specifies, it has no knowledge of jobs, queues, retries, or sleeping; it returns a small <code>Result</code> (<code>decision</code>, <code>request</code>, <code>ratelimit_reset</code>) and leaves scheduling entirely to whatever calls it - the rake task and Solid Queue job that Phases 6 and 7 will build.</p>
+
+<h3>Design decisions</h3>
+<table>
+<tr><th>Area</th><th>Decision</th><th>Why</th></tr>
+<tr>
+  <td>Decision order</td>
+  <td>Cold start (no <code>Request</code> row at all) → poll. Else rate-limit floor check → else poll-interval check → else backlog check → else idle.</td>
+  <td>Follows the design's numbered list in "Deciding what to do this cycle" exactly, including its explicit cold-start override ("assume full budget and poll immediately").</td>
+</tr>
+<tr>
+  <td>Rate-limit floor</td>
+  <td><code>RATE_LIMIT_SAFETY_FLOOR = 5</code>, checked against the most recent <code>Request</code> row of <em>any</em> purpose.</td>
+  <td>Design: "the most recent <code>Request</code> row (any purpose)... the ground truth from Github's last response to us, whichever entry point made it" and "a safety floor (e.g. 5)."</td>
+</tr>
+<tr>
+  <td>Backlog query</td>
+  <td>A single query: <code>PushEvent.where(repo_unenrichable: false, repository_id: nil).or(PushEvent.where(user_unenrichable: false, author_id: nil)).order(:created_at).first</code> - the union of both needs-repo and needs-user, oldest first.</td>
+  <td>Matches the design's backlog definition and "enrich the oldest backlog item" verbatim - one query rather than two separate lookups, since "oldest across either queue" is what the design asks for.</td>
+</tr>
+<tr>
+  <td>A backlog item needing both repo and user enrichment</td>
+  <td>Repository enrichment is tried first (<code>push_event.repository_id.nil? &amp;&amp; !push_event.repo_unenrichable?</code> is checked before falling through to user enrichment). Since only one HTTP request happens per cycle, this item will need to come up again on a later cycle for the other half.</td>
+  <td>The design doesn't state an order for this case explicitly. Repo-before-user was picked arbitrarily but applied consistently - "at most one HTTP request per call" already means one side has to wait either way, and the item stays in the backlog (still <code>author_id: nil</code>) so it's picked up again rather than lost.</td>
+</tr>
+<tr>
+  <td>Errored requests within a cycle</td>
+  <td><code>IngestCycle</code> doesn't distinguish a decision that failed from one that succeeded - <code>Github::PollPushEvents</code>/<code>EnrichUser</code>/<code>EnrichRepository</code> already log the ERROR and return <code>nil</code> internally (Phases 2-4); <code>IngestCycle</code> just passes that <code>nil</code> through as <code>Result#request</code>.</td>
+  <td>Design: "the cycle logs the error; the caller reschedules with the same computed wait as any other cycle rather than a special backoff, since the next cycle will simply attempt the same work again" - no special handling needed here because the underlying service objects already log and the next cycle's state (unchanged <code>Request</code>/backlog) naturally causes a retry.</td>
+</tr>
+<tr>
+  <td><code>Result</code> shape</td>
+  <td><code>Struct.new(:decision, :request, :ratelimit_reset, keyword_init: true)</code>, with <code>decision</code> one of <code>:poll</code>, <code>:enrich_repository</code>, <code>:enrich_user</code>, <code>:rate_limited</code>, <code>:idle</code>.</td>
+  <td>Phases 6/7 need to know what to reschedule for. <code>ratelimit_reset</code> is only populated for <code>:rate_limited</code>, since that's the only branch where the design says the caller needs it ("the caller reschedules for <code>ratelimit_reset</code>"); the other branches' wait computation (a fixed idle wait, or "the same computed wait as any other cycle") doesn't need anything else from this service.</td>
+</tr>
+<tr>
+  <td><code>EnrichUser</code>/<code>EnrichRepository</code> return value</td>
+  <td>Both now end their <code>call</code> method by returning <code>result.request</code> (the <code>Request</code> row <code>Github::ApiRequest</code> persisted), matching <code>PollPushEvents</code>' existing contract.</td>
+  <td>Small tweak made before writing <code>IngestCycle</code>, so it can compose all three service objects the same way without an extra query to re-find the request each one made. Existing Phase 3/4 tests assert database state, not return values, so this didn't require touching them.</td>
+</tr>
+</table>
+
+<h3>Testing</h3>
+<p><code>test/services/github/ingest_cycle_test.rb</code> covers: cold start (zero <code>Request</code> rows) polling immediately, the rate-limit floor short-circuiting with zero HTTP calls, polling once the poll interval has elapsed, falling through to enrichment when it hasn't, prioritizing repository enrichment over user enrichment for an item needing both (asserting the user endpoint is never requested that cycle), picking the globally oldest backlog item ahead of a newer one, idling when nothing is due, and excluding a push event that's <code>_unenrichable</code> on both sides from ever reappearing in the backlog. 8 tests, 22 assertions, all green - 64 tests/188 assertions across the whole suite. <code>bin/rubocop</code> and <code>bin/brakeman</code> both clean.</p>
+
 <h2>Phase 6 — Rake task ("repeatable") <span class="status pending">pending</span></h2>
 <h2>Phase 7 — Solid Queue job ("continuous") <span class="status pending">pending</span></h2>
 <h2>Phase 8 — Docker Compose wiring <span class="status pending">pending</span></h2>

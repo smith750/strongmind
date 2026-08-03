@@ -33,6 +33,7 @@ module Github
       return unless result
 
       handle_response(result.response, github_repository_id, existing_repository)
+      result.request
     end
 
     private
