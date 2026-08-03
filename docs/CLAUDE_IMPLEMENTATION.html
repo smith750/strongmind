@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Claude's Implementation Notes</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1.5rem; line-height: 1.55; color: #1a1a1a; }
+  h1 { border-bottom: 3px solid #2c3e50; padding-bottom: 0.4rem; }
+  h2 { margin-top: 2.5rem; color: #2c3e50; border-left: 5px solid #2c3e50; padding-left: 0.6rem; }
+  h3 { margin-top: 1.5rem; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
+  code { background: #f2f2f2; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.9em; }
+  pre { background: #f2f2f2; padding: 0.8rem 1rem; border-radius: 6px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { border: 1px solid #ddd; padding: 0.45rem 0.7rem; text-align: left; vertical-align: top; font-size: 0.95em; }
+  th { background: #f2f2f2; }
+  .status { display: inline-block; font-size: 0.8em; font-weight: bold; padding: 0.15rem 0.6rem; border-radius: 999px; }
+  .status.done { background: #d4edda; color: #155724; }
+  .status.pending { background: #eee; color: #666; }
+  .note { background: #fff8e1; border-left: 4px solid #f0ad4e; padding: 0.6rem 1rem; margin: 1rem 0; }
+  ul { padding-left: 1.4rem; }
+</style>
+</head>
+<body>
+
+<h1>Claude's Implementation Notes</h1>
+<p>This file tracks, phase by phase, what was actually built against <code>docs/DESIGN.md</code>, plus any decisions or deviations made along the way. Each phase gets its own section, added as the phase is completed.</p>
+
+<h2>Phase 1 — Create models <span class="status done">done</span></h2>
+
+<p>Built the four ActiveRecord models called for in the design: <code>Repository</code>, <code>User</code> (the "Contributor" model), <code>PushEvent</code>, and <code>Request</code> (the rate-limit tracking model from the "Rate limits" section). Generated via <code>bin/rails generate model</code>, then hand-edited the migrations to match the design's field-by-field spec exactly (types, uniqueness, defaults).</p>
+
+<h3>Schema decisions</h3>
+<table>
+<tr><th>Model</th><th>Decision</th><th>Why</th></tr>
+<tr>
+  <td><code>Repository</code></td>
+  <td><code>github_repository_id</code> is <code>NOT NULL</code> with a unique index; validated for presence + uniqueness at the model level too.</td>
+  <td>Design explicitly calls for "unique constraint and index." DB-level constraint is the real guarantee; the model validation gives a friendlier error path for normal <code>save</code> calls.</td>
+</tr>
+<tr>
+  <td><code>User</code></td>
+  <td>Same treatment for <code>github_user_id</code>.</td>
+  <td>Design explicitly calls for "unique constraint and index," mirroring <code>Repository</code>.</td>
+</tr>
+<tr>
+  <td><code>PushEvent</code></td>
+  <td><code>github_event_id</code> is <code>NOT NULL</code> with a unique index (design calls this the "globally unique key from github"). <code>repository_id</code> / <code>author_id</code> are nullable foreign keys, and <code>belongs_to</code> is declared <code>optional: true</code> for both.</td>
+  <td>The whole point of <code>repository_id</code>/<code>author_id</code> per the design is that they start empty and get filled in later by the enrichment fan-out (Phase 3/4) — a push event has to be a valid, savable record before enrichment ever runs.</td>
+</tr>
+<tr>
+  <td><code>PushEvent</code></td>
+  <td><code>author</code> association: <code>belongs_to :author, class_name: "User", inverse_of: :push_events</code>, backed by an <code>author_id</code> foreign key that references <code>users</code> (not the Rails-inferred <code>authors</code> table).</td>
+  <td>Design names the column <code>author_id</code> but the model it points at is <code>User</code>; <code>t.references :author</code> defaults to inferring an <code>authors</code> table, so the migration needed an explicit <code>foreign_key: { to_table: :users }</code>.</td>
+</tr>
+<tr>
+  <td><code>PushEvent</code></td>
+  <td><code>repo_unenrichable</code> / <code>user_unenrichable</code> are booleans, <code>NOT NULL DEFAULT false</code>.</td>
+  <td>These flags gate the Phase 5 backlog query (<code>Continuous Ingestion</code> section); they need a real default so every row is queryable from the moment it's inserted, not just after an enrichment attempt sets them explicitly.</td>
+</tr>
+<tr>
+  <td><code>PushEvent</code></td>
+  <td>Added composite indexes <code>[repository_id, repo_unenrichable]</code> and <code>[author_id, user_unenrichable]</code>, beyond what the design's field list strictly asks for.</td>
+  <td>The design spells out the exact backlog query these support: <code>PushEvent.where(repository_id: nil, repo_unenrichable: false)</code> and the equivalent for authors. Since this is schema-level and the query shape is already fully specified in the design doc, it seemed better to add the supporting index now rather than as a follow-up migration in Phase 5.</td>
+</tr>
+<tr>
+  <td><code>Request</code></td>
+  <td><code>purpose</code> implemented as a Rails <code>enum</code>: <code>{ poll: 0, enrich_repo: 1, enrich_user: 2 }</code>, <code>NOT NULL</code>.</td>
+  <td>Matches the design's enum spec exactly.</td>
+</tr>
+<tr>
+  <td><code>Request</code></td>
+  <td><code>poll_interval</code> is <code>NOT NULL DEFAULT 0</code>.</td>
+  <td>Design: "defaults to 0 seconds but uses the X-Poll-Interval response header if it was returned."</td>
+</tr>
+<tr>
+  <td><code>Request</code></td>
+  <td>Index on <code>created_at</code>, plus a composite index on <code>[purpose, created_at]</code>.</td>
+  <td>Design explicitly asks for the <code>created_at</code> index ("we'll be querying against that"). The composite index directly supports the two lookups Phase 5's <code>IngestCycle</code> will do every cycle: most recent <code>Request</code> row overall, and most recent <code>Request</code> row where <code>purpose = poll</code>.</td>
+</tr>
+<tr>
+  <td>All four models</td>
+  <td><code>full_info</code> stored as a plain <code>text</code> column, not <code>jsonb</code>.</td>
+  <td>Design specifies "text (JSON)" — kept literal rather than upgrading to a JSON column type, since that wasn't asked for and isn't needed yet (YAGNI, per the design's own stated philosophy for these models).</td>
+</tr>
+</table>
+
+<h3>Associations</h3>
+<ul>
+  <li><code>Repository has_many :push_events</code></li>
+  <li><code>User has_many :push_events, foreign_key: :author_id, inverse_of: :author</code></li>
+  <li><code>PushEvent belongs_to :repository, optional: true</code></li>
+  <li><code>PushEvent belongs_to :author, class_name: "User", inverse_of: :push_events, optional: true</code></li>
+</ul>
+
+<h3>Testing</h3>
+<p>Wrote model tests (<code>test/models/*_test.rb</code>) covering, per model: presence/uniqueness validation, the underlying DB-level unique constraint (via <code>ActiveRecord::RecordNotUnique</code> on a raw <code>insert!</code> that bypasses model validation), association wiring, and the <code>Request</code> enum/defaults. 24 tests, 41 assertions, all green. Also ran <code>bin/rubocop</code> against the new migrations, models, and tests — no offenses.</p>
+
+<div class="note">
+<strong>Environment note:</strong> Docker wasn't running in this session, so migrations and tests were run directly against the host's local Postgres (already running, matching Ruby 4.0.6 via rbenv) using env var overrides — <code>DATABASE_HOST=localhost DATABASE_USERNAME=james DATABASE_PASSWORD=</code> — rather than the <code>postgres</code>/<code>postgres</code> credentials <code>config/database.yml</code> defaults to for the Docker Compose setup. This only affected how the databases were reached this session; no application or config code was changed to accommodate it, and the Docker Compose path (<code>db</code> service with <code>postgres</code>/<code>postgres</code>) is untouched and still what Phase 8 will wire up end-to-end.
+</div>
+
+<h2>Phase 2 — Pull service object (page of pushes) <span class="status pending">pending</span></h2>
+<h2>Phase 3 — Pull contributors <span class="status pending">pending</span></h2>
+<h2>Phase 4 — Pull repositories <span class="status pending">pending</span></h2>
+<h2>Phase 5 — <code>Github::IngestCycle</code> budget/backlog logic <span class="status pending">pending</span></h2>
+<h2>Phase 6 — Rake task ("repeatable") <span class="status pending">pending</span></h2>
+<h2>Phase 7 — Solid Queue job ("continuous") <span class="status pending">pending</span></h2>
+<h2>Phase 8 — Docker Compose wiring <span class="status pending">pending</span></h2>
+
+</body>
+</html>
