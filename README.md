@@ -151,4 +151,3 @@ docker compose down -v    # stop containers AND wipe all data - fresh start
    -- rate-limit history:
    select purpose, status_code, ratelimit_remaining, created_at from requests order by created_at desc limit 10;
    ```
-
