@@ -77,5 +77,7 @@ Rails.application.configure do
 
   # Log to STDOUT with the current request id as a default log tag.
   config.log_tags = [ :request_id ]
-  config.logger   = ActiveSupport::TaggedLogging.logger(STDOUT)
+  logger = ActiveSupport::Logger.new(STDOUT)
+  logger.formatter = proc { |severity, time, _progname, msg| "#{time.utc.iso8601(3)} #{severity} -- #{msg}\n" }
+  config.logger = ActiveSupport::TaggedLogging.new(logger)
 end
