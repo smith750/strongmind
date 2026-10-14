@@ -54,4 +54,4 @@ group :development, :test do
   gem "rubocop-rails-omakase", require: false
 end
 
-gem "webmock", "~> 3.26", group: :test
+gem "webmock", "~> 3.29", group: :test
